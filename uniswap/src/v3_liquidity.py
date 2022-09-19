@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from src.constants import MAX_TICK, MIN_TICK
+from constants import MAX_TICK, MIN_TICK
 
 UNISWAP_BASE = 1.0001
 
@@ -23,8 +23,6 @@ def price_to_tick(price):
     price to tick
     """
     return log(price) / log(UNISWAP_BASE)
-
-
 
 
 def get_liquidity_in_ticks(pool_contract: 'Contract',
@@ -132,10 +130,9 @@ def get_amount_in_ticks(pool_contract: 'Contract', token0: 'Token', token1: 'Tok
 
     df_pool = (
         pd.DataFrame(token_amounts, columns=['tick', 'token0', 'token1','liquidity'])
-        .astype({'tick': 'int', 'token0': 'float', 'token1': 'float', 'liquidity': 'float'})
+        .astype({'tick': 'int', 'token0': 'float', 'token1': 'float'})
         .assign(token0_locked = lambda x: x.token0,
                 token1_locked = lambda x: x.token1)
-
         .assign(token0_locked = lambda x: x.token0_locked.where(x.tick >= current_range_bottom_tick, 0),
                 token1_locked = lambda x: x.token1_locked.where(x.tick <= current_range_bottom_tick, 0))
         .assign(token0_scaled = lambda x: x.token0 / 10**decimals0,
