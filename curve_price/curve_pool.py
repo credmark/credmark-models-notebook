@@ -57,8 +57,6 @@ class CurveStableSwap:
             except ContractLogicError as _err:
                 break
 
-        # if self.n_coins != 2:
-        #    raise ValueError(f'Not a 2-pool for {pool_addr} with {self._balances} in {self.coins}')
         print(f'{pool_addr} for {self.n_coins} coins loaded')
 
 
@@ -100,7 +98,6 @@ class CurveStableSwap:
         """
         return [tok.decimals for tok in self.coins]
 
-
     def scale_coin(self, i, v):
         """
         Return scaled balance to token i with 18 decimals.
@@ -126,44 +123,6 @@ class CurveStableSwap:
             return (virtual_price, vp_estimate, vp_estimate - virtual_price)
         except ABIFunctionNotFound:
             return None
-
-
-    def _get_D(self, _xp, _amp):
-        """
-        D invariant calculation in non-overflowing integer operations
-        iteratively
-        A * sum(x_i) * n**n + D = A * D * n**n + D**(n+1) / (n**n * prod(x_i))
-        Converging solution:
-        D[j+1] = (A * n**n * sum(x_i) - D[j]**(n+1) / (n**n prod(x_i))) / (A * n**n - 1)
-        """
-        S = 0
-        Dprev = 0
-
-        for _x in _xp:
-            S += _x
-        if S == 0:
-            return 0
-
-        D = S
-        Ann = _amp * self.n_coins
-        for _i in range(255):
-            D_P = D
-            for _x in _xp:
-                D_P = (D_P * D) // (_x * self.n_coins)  # If division by 0, this will be borked: only withdrawal will work. And that is good
-            Dprev = D
-            D = ((Ann * S + D_P * self.n_coins) * D) // ((Ann - 1) * D + (self.n_coins + 1) * D_P)
-
-            # Equality with the precision of 1
-            if D > Dprev:
-                if D - Dprev <= 1:
-                    return D
-            else:
-                if Dprev - D <= 1:
-                    return D
-
-        # convergence typically occurs in 4 rounds or less, this should be unreachable!
-        # if it does happen the pool is borked and LPs can withdraw via `remove_liquidity`
-        raise ValueError('not converge for D')
 
     def self_test(self, i = 0, j = 1):
         """
@@ -320,6 +279,42 @@ class CurveStableSwap:
 
         raise ValueError('not converge for y')
 
+    def _get_D(self, _xp, _amp):
+        """
+        D invariant calculation in non-overflowing integer operations
+        iteratively
+        A * sum(x_i) * n**n + D = A * D * n**n + D**(n+1) / (n**n * prod(x_i))
+        Converging solution:
+        D[j+1] = (A * n**n * sum(x_i) - D[j]**(n+1) / (n**n prod(x_i))) / (A * n**n - 1)
+        """
+        S = 0
+        Dprev = 0
+
+        for _x in _xp:
+            S += _x
+        if S == 0:
+            return 0
+
+        D = S
+        Ann = _amp * self.n_coins
+        for _i in range(255):
+            D_P = D
+            for _x in _xp:
+                D_P = (D_P * D) // (_x * self.n_coins)  # If division by 0, this will be borked: only withdrawal will work. And that is good
+            Dprev = D
+            D = ((Ann * S + D_P * self.n_coins) * D) // ((Ann - 1) * D + (self.n_coins + 1) * D_P)
+
+            # Equality with the precision of 1
+            if D > Dprev:
+                if D - Dprev <= 1:
+                    return D
+            else:
+                if Dprev - D <= 1:
+                    return D
+
+        # convergence typically occurs in 4 rounds or less, this should be unreachable!
+        # if it does happen the pool is borked and LPs can withdraw via `remove_liquidity`
+        raise ValueError('not converge for D')
 
     def _get_y_D(self, A, i, _xp, D):
         """

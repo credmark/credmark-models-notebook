@@ -14,8 +14,19 @@ class CurveStableSwapGamma:
     """
     Curve Stable Swap (for 2) with gamma
     """
-    FEE_DENOMINATOR = 10 ** 10
     PRECISION = 10 ** 18
+    A_MULTIPLIER = 10000
+
+    MIN_GAMMA = 10**10
+    MAX_GAMMA = 2 * 10**16
+
+    @property
+    def MIN_A(self):
+        return self.n_coins**self.n_coins * self.A_MULTIPLIER // 10
+
+    @property
+    def MAX_A(self):
+        return self.n_coins**self.n_coins * self.A_MULTIPLIER * 100000
 
     def __init__(self, pool_addr):
         self._pool_addr = pool_addr
@@ -35,8 +46,14 @@ class CurveStableSwapGamma:
         self.A = self._pool.functions.A().call()
         self.gamma = self._pool.functions.gamma().call()
         self.fee = self._pool.functions.fee().call()
+        self.is_killed = self._pool.functions.is_killed().call()
+        self.price_scale = self._pool.functions.price_scale().call()
+        self.D = self._pool.functions.D().call()
+        self.fee_gamma = self._pool.functions.fee_gamma().call()
+        self.mid_fee = self._pool.functions.mid_fee().call()
+        self.out_fee = self._pool.functions.out_fee().call()
 
-        self.balances = []
+        self._balances = []
         self.coins = []
         self.n_coins = 0
         self.coins_mult = []
@@ -44,25 +61,58 @@ class CurveStableSwapGamma:
             try:
                 token_addr = self._pool.functions.coins(i).call()
                 token_bal = self._pool.functions.balances(i).call()
-                self.balances.append(token_bal)
+                self._balances.append(token_bal)
                 self.coins.append(Token(token_addr))
-                self.coins_mult.append(10 ** (18 + 18 - Token(token_addr).decimals))
+                self.coins_mult.append(10 ** (18 - Token(token_addr).decimals))
                 self.n_coins += 1
             except ContractLogicError as _err:
                 break
 
-        if self.n_coins != 2:
-            raise ValueError(f'Not a 2-pool for {pool_addr} with {self.balances} in {self.coins}')
+        print(f'{pool_addr} for {self.n_coins} coins loaded')
+
+    def _A_gamma(self):
+        return [self.A, self.gamma].copy()
+
 
     def xp(self, xp = None):
         """
         Return scaled balance to level all tokens with 18 decimals.
         """
         if xp is None:
-            xp = self.balances.copy()
-        for i in range(self.n_coins):
-            xp[i] = self.scale_coin(i, xp[i])
-        return xp
+            xp = self._balances.copy()
+        # for i in range(self.n_coins):
+        #     xp[i] = self.scale_coin(i, xp[i])
+        # return xp
+        return [self.balances[0] * self.coins_mult[0],
+                (self.balances[1] * self.coins_mult[1] * self.price_scale) // self.PRECISION]
+
+    @property
+    def scaled_balances(self):
+        """
+        return scaled balances
+        """
+        return [self.coins[n].scaled(bal) for n, bal in enumerate(self._balances)]
+
+    @property
+    def balances(self):
+        """
+        return scaled balances
+        """
+        return self._balances.copy()
+
+    @property
+    def coins_symbol(self):
+        """
+        return coins' symbol
+        """
+        return [tok.symbol for tok in self.coins]
+
+    @property
+    def coins_decimals(self):
+        """
+        return coins' decimals
+        """
+        return [tok.decimals for tok in self.coins]
 
     def scale_coin(self, i, v):
         """
@@ -76,208 +126,406 @@ class CurveStableSwapGamma:
         """
         return (v * self.PRECISION) // self.coins_mult[i]
 
-    def estimate_virtual_price(self):
+    def self_test(self, i = 0, j = 1):
         """
-        estimate D
+        Run self-test for running this and smart contract's implementations.
         """
-        try:
-            lp_token = Token(Address(self._pool.functions.lp_token().call()))
-            lp_token_supply = lp_token.total_supply
-            virtual_price = self._pool.functions.get_virtual_price().call()
+        print(f'Self-test for {self._pool_addr} with various amount')
 
-            vp_estimate = (self._get_D(self.xp(), self.A) * self.PRECISION) // lp_token_supply
-            return (virtual_price, vp_estimate, vp_estimate - virtual_price)
-        except ABIFunctionNotFound:
-            return None
+        print('Test get_dy_dx0 with current balance')
+        print(f'Exchange ({i} for {j}), ({j} for {i})')
+        print('(this, web3, difference)')
 
-
-    def _get_D(self, _xp, _amp):
-        """
-        D invariant calculation in non-overflowing integer operations
-        iteratively
-        A * sum(x_i) * n**n + D = A * D * n**n + D**(n+1) / (n**n * prod(x_i))
-        Converging solution:
-        D[j+1] = (A * n**n * sum(x_i) - D[j]**(n+1) / (n**n prod(x_i))) / (A * n**n - 1)
-        """
-        S = 0
-        Dprev = 0
-
-        for _x in _xp:
-            S += _x
-        if S == 0:
-            return 0
-
-        D = S
-        Ann = _amp * self.n_coins
-        for _i in range(255):
-            D_P = D
-            for _x in _xp:
-                D_P = (D_P * D) // (_x * self.n_coins)  # If division by 0, this will be borked: only withdrawal will work. And that is good
-            Dprev = D
-            D = ((Ann * S + D_P * self.n_coins) * D) // ((Ann - 1) * D + (self.n_coins + 1) * D_P)
-
-            # Equality with the precision of 1
-            if D > Dprev:
-                if D - Dprev <= 1:
-                    return D
-            else:
-                if Dprev - D <= 1:
-                    return D
-
-        # convergence typically occurs in 4 rounds or less, this should be unreachable!
-        # if it does happen the pool is borked and LPs can withdraw via `remove_liquidity`
-        raise ValueError('not converge for D')
-
-    def self_test(self):
-        """
-        estimate dy
-        """
-        for amount in [1,1000, 10000, 100000]:
-            x0 = self.get_dy(0, 1, amount)
-            y0 = self.get_dy(1, 0, amount)
+        for amount in [1,1000, 10000, 100000, 10000000000000000]:
+            x0 = self.get_dy_dx0(i, j, amount)
+            y0 = self.get_dy_dx0(j, i, amount)
             try:
-                x1 = self._pool.functions.get_dy(0, 1, amount).call()
+                x1 = self._pool.functions.get_dy(i, j, amount).call()
                 x_diff = x0-x1
             except ContractLogicError:
                 x1 = None
                 x_diff = None
             try:
-                y1 = self._pool.functions.get_dy(1, 0, amount).call()
+                y1 = self._pool.functions.get_dy(j, i, amount).call()
                 y_diff = y0-y1
             except ContractLogicError:
                 y1 = None
                 y_diff = None
 
-            print((amount, (x0,x1,x_diff),(y0,y1,y_diff)))
+            print((amount, (x0,x1,x_diff),(y0,y1,y_diff), x_diff == 0 and y_diff == 0))
 
-    def get_dy_xp(self, i, j, _dx, xp):
-        """
-        get dy with non-scaled dx, xp
-        """
-        for xp_i,xp_v in enumerate(xp):
-            xp[xp_i] = xp_v * (10 ** self.coins[xp_i].decimals)
-        _dx = _dx * (10 ** self.coins[i].decimals)
+        print('Test get_dy_dx0_xp0/get_dy_dx_xp/get_dy_dx_xp with current balance')
 
-        x = xp[i] + self.scale_coin(i, _dx)
-        y = self._get_y(i, j, x, xp)
+        for (n, m) in [(i, j), (j, i)]:
+            amount = int(100 * 10 ** self.coins[n].decimals)
+            x0 = self._pool.functions.get_dy(n, m, amount).call()
+            x1 = self.get_dy_dx0(n, m, amount)
+            x2 = self.get_dy_dx0_xp0(n, m, amount, self._balances)
+            x3 = int(self.get_dy_dx(n, m,
+                                self.coins[n].scaled(amount))
+                * (10 ** self.coins[m].decimals))
+            x4 = int(self.get_dy_dx_xp(n, m,
+                                self.coins[n].scaled(amount),
+                                [self.coins[i].scaled(v) for i, v in enumerate(self._balances)])
+                * (10 ** self.coins[m].decimals))
+            x01_diff = x0 - x1
+            x12_diff = x2 - x1
+            x23_diff = x3 - x2
+            x34_diff = x4 - x3
+            print(((n, m), amount, (x0,x1,x2,x3,x4, x01_diff, x12_diff, x23_diff, x34_diff)))
+
+    def get_dy_dx0(self, i, j, _dx):
+        """
+        get dy with non-scaled dx0, returns non-scaled dy
+        """
+        assert i != j  # dev: same input and output coin
+        assert i < self.n_coins  # dev: coin index out of range
+        assert j < self.n_coins  # dev: coin index out of range
+
+        price_scale = self.price_scale * self.coins_mult[1]
+        xp = self._balances.copy()
+
+        A_gamma = self._A_gamma()
+        D = self.D
+        D2 = self.newton_D(A_gamma[0], A_gamma[1], self.xp())
+
+        print(f'{xp=} {D=} {D2=}')
+
+        xp[i] += _dx
+        xp = [xp[0] * self.coins_mult[0], (xp[1] * price_scale) // self.PRECISION]
+
+        print(f'{xp=} {A_gamma=} {D=} {j=} {price_scale=}')
+
+        y = self.newton_y(A_gamma[0], A_gamma[1], xp, D, j)
         dy = xp[j] - y - 1
-        fee = self.fee * dy // self.FEE_DENOMINATOR
-        return self.coins[j].scaled(self.scale_back_coin(j, dy - fee))
+        xp[j] = y
+        if j > 0:
+            dy = (dy * self.PRECISION) // price_scale
+        else:
+            dy //= self.coins_mult[0]
+        dy -= (self._fee(xp) * dy) // 10**10
 
-    def get_dy_1(self, i, j, _dx):
+        return dy
+
+    def _fee(self, xp):
         """
-        get dy
+        f = fee_gamma / (fee_gamma + (1 - K))
+        where
+        K = prod(x) / (sum(x) / N)**N
+        (all normalized to 1e18)
         """
-        xp = self.xp()
-        x = xp[i] + self.scale_coin(i, _dx)
-        y = self._get_y(i, j, x, xp)
-        dy = xp[j] - y - 1
-        fee = self.fee * dy // self.FEE_DENOMINATOR
-        return self.scale_back_coin(j, dy - fee)
+        fee_gamma = self.fee_gamma
+        f = xp[0] + xp[1]  # sum
+        f = fee_gamma * 10**18 // (
+            fee_gamma + 10**18 - (10**18 * self.n_coins**self.n_coins) * xp[0] // f * xp[1] // f
+        )
+        return (self.mid_fee * f + self.out_fee * (10**18 - f)) // 10**18
 
-    def get_dy(self, i, j, _dx):
+    def newton_y(self, ANN, gamma, x, D, i):
         """
-        get dy
+        Calculating x[i] given other balances x[0..self.n_coins-1] and invariant D
+        ANN = A * N**N
         """
-        xp = self.xp()
-        x = xp[i] + self.scale_coin(i, _dx)
-        y = self._get_y(i, j, x, xp)
-        dy = xp[j] - y - 1
-        fee = self.fee * dy // self.FEE_DENOMINATOR
-        return self.scale_back_coin(j, dy - fee)
+        # Safety checks
+        assert ANN > self.MIN_A - 1 and ANN < self.MAX_A + 1  # dev: unsafe values A
+        assert gamma > self.MIN_GAMMA - 1 and gamma < self.MAX_GAMMA + 1  # dev: unsafe values gamma
+        assert D > 10**17 - 1 and D < 10**15 * 10**18 + 1 # dev: unsafe values D
 
-    def _get_y(self, i, j, x, _xp):
-        """
-        Calculate x[j] if one makes x[i] = x
-        Done by solving quadratic equation iteratively.
-        x_1**2 + x_1 * (sum' - (A*n**n - 1) * D / (A * n**n)) = D ** (n + 1) / (n ** (2 * n) * prod' * A)
-        x_1**2 + b*x_1 = c
-        x_1 = (x_1**2 + c) / (2*x_1 + b)
-        """
-        # x in the input is converted to the same price/precision
+        x_j = x[1 - i]
+        y = D**2 // (x_j * self.n_coins**2)
+        K0_i = ((10**18 * self.n_coins) * x_j) // D
+        # S_i = x_j
 
-        assert i != j       # dev: same coin
-        assert j >= 0       # dev: j below zero
-        assert j < self.n_coins  # dev: j above self.n_coins
+        # frac = x_j * 1e18 / D => frac = K0_i / self.n_coins
+        assert (K0_i > 10**16*self.n_coins - 1) and (K0_i < 10**20*self.n_coins + 1)  # dev: unsafe values x[i]
 
-        # should be unreachable, but good for safety
-        assert i >= 0
-        assert i < self.n_coins
+        # x_sorted[self.n_coins] = x
+        # x_sorted[i] = 0
+        # x_sorted = self.sort(x_sorted)  # From high to low
+        # x[not i] instead of x_sorted since x_soted has only 1 element
 
-        A = self.A
-        D = self._get_D(_xp, A)
-        Ann = A * self.n_coins
-        c = D
-        S = 0
-        _x = 0
-        y_prev = 0
+        convergence_limit = max(max(x_j // 10**14, D // 10**14), 100)
 
-        for _i in range(self.n_coins):
-            if _i == i:
-                _x = x
-            elif _i != j:
-                _x = _xp[_i]
-            else:
-                continue
-            S += _x
-            c = c * D // (_x * self.n_coins)
-        c = c * D // (Ann * self.n_coins)
-        b = S + D // Ann  # - D
-        y = D
-
-        for _i in range(255):
+        for j in range(255):
             y_prev = y
-            y = (y*y + c) // (2 * y + b - D)
-            # Equality with the precision of 1
-            if y > y_prev:
-                if y - y_prev <= 1:
-                    return y
+
+            K0 = (K0_i * y * self.n_coins) // D
+            S = x_j + y
+
+            _g1k0 = gamma + 10**18
+            if _g1k0 > K0:
+                _g1k0 = _g1k0 - K0 + 1
             else:
-                if y_prev - y <= 1:
-                    return y
+                _g1k0 = K0 - _g1k0 + 1
 
-        raise ValueError('not converge for y')
+            # D / (A * N**N) * _g1k0**2 / gamma**2
+            mul1 = (((10**18 * D) // gamma * _g1k0) // gamma * _g1k0 * self.A_MULTIPLIER) // ANN
 
+            # 2*K0 / _g1k0
+            mul2 = 10**18 + ((2 * 10**18) * K0) // _g1k0
 
-    def _get_y_D(self, A, i, _xp, D):
-        """
-        Calculate x[i] if one reduces D from being calculated for xp to D
-        Done by solving quadratic equation iteratively.
-        x_1**2 + x_1 * (sum' - (A*n**n - 1) * D / (A * n**n)) = D ** (n + 1) / (n ** (2 * n) * prod' * A)
-        x_1**2 + b*x_1 = c
-        x_1 = (x_1**2 + c) / (2*x_1 + b)
-        """
-        # x in the input is converted to the same price/precision
-
-        assert i >= 0  # dev: i below zero
-        assert i < self.n_coins  # dev: i above self.n_coins
-
-        Ann = A * self.n_coins
-        c = D
-        S = 0
-        _x = 0
-        y_prev = 0
-
-        for _i in range(self.n_coins):
-            if _i != i:
-                _x = _xp[_i]
-            else:
+            yfprime = 10**18 * y + S * mul2 + mul1
+            _dyfprime = D * mul2
+            if yfprime < _dyfprime:
+                y = y_prev // 2
                 continue
-            S += _x
-            c = c * D // (_x * self.n_coins)
-        c = c * D // (Ann * self.n_coins)
-        b = S + D // Ann
-        y = D
-
-        for _i in range(255):
-            y_prev = y
-            y = (y*y + c) // (2 * y + b - D)
-            # Equality with the precision of 1
-            if y > y_prev:
-                if y - y_prev <= 1:
-                    return y
             else:
-                if y_prev - y <= 1:
-                    return y
+                yfprime -= _dyfprime
+            fprime = yfprime // y
 
-        raise ValueError('not converge for D_y')
+            # y -= f / f_prime;  y = (y * fprime - f) / fprime
+            # y = (yfprime + 10**18 * D - 10**18 * S) // fprime + mul1 // fprime * (10**18 - K0) // K0
+            y_minus = mul1 // fprime
+            y_plus = (yfprime + 10**18 * D) // fprime + (y_minus * 10**18) // K0
+            y_minus += (10**18 * S) // fprime
+
+            if y_plus < y_minus:
+                y = y_prev // 2
+            else:
+                y = y_plus - y_minus
+
+            diff = 0
+            if y > y_prev:
+                diff = y - y_prev
+            else:
+                diff = y_prev - y
+            if diff < max(convergence_limit, y // 10**14):
+                frac = (y * 10**18) // D
+                assert (frac > 10**16 - 1) and (frac < 10**20 + 1)  # dev: unsafe value for y
+                return y
+
+        raise ValueError(f"Did not converge for y {(y, y_prev, y - y_prev)}")
+
+
+    def _exchange(self, sender, mvalue, i, j, dx, min_dy, use_eth: bool):
+        assert not self.is_killed  # dev: the pool is killed
+        assert i != j  # dev: coin index out of range
+        assert i < self.n_coins  # dev: coin index out of range
+        assert j < self.n_coins  # dev: coin index out of range
+        assert dx > 0  # dev: do not exchange 0 coins
+
+        A_gamma = self._A_gamma()
+        xp = self.balances
+        p = 0
+        dy = 0
+
+        _coins = coins
+
+        if use_eth and i == ETH_INDEX:
+            assert mvalue == dx  # dev: incorrect eth amount
+        else:
+            assert mvalue == 0  # dev: nonzero eth amount
+            assert ERC20(_coins[i]).transferFrom(sender, self, dx)
+            if i == ETH_INDEX:
+                WETH(_coins[i]).withdraw(dx)
+
+        y = xp[j]
+        x0 = xp[i]
+        xp[i] = x0 + dx
+        self.balances[i] = xp[i]
+
+        price_scale = self.price_scale
+
+        xp = [xp[0] * self.coin_mult[0], xp[1] * price_scale * self.coin_mult[1] / self.PRECISION]
+
+        prec_i = self.coin_mult[0]
+        prec_j = self.coin_mult[1]
+        if i == 1:
+            prec_i = self.coin_mult[1]
+            prec_j = self.coin_mult[0]
+
+        # In case ramp is happening
+        t = self.future_A_gamma_time
+        if t > 0:
+            x0 *= prec_i
+            if i > 0:
+                x0 = x0 * price_scale / self.PRECISION
+            x1 = xp[i]  # Back up old value in xp
+            xp[i] = x0
+            self.D = self.newton_D(A_gamma[0], A_gamma[1], xp)
+            xp[i] = x1  # And restore
+            if block.timestamp >= t:
+                self.future_A_gamma_time = 1
+
+        dy = xp[j] - self.newton_y(A_gamma[0], A_gamma[1], xp, self.D, j)
+        # Not defining new "y" here to have less variables / make subsequent calls cheaper
+        xp[j] -= dy
+        dy -= 1
+
+        if j > 0:
+            dy = dy * self.PRECISION / price_scale
+        dy /= prec_j
+
+        dy -= self._fee(xp) * dy / 10**10
+        assert dy >= min_dy, "Slippage"
+        y -= dy
+
+        self.balances[j] = y
+
+        if use_eth and j == ETH_INDEX:
+            raw_call(sender, b"", value=dy)
+        else:
+            if j == ETH_INDEX:
+                WETH(_coins[j]).deposit(value=dy)
+            assert ERC20(_coins[j]).transfer(sender, dy)
+
+        y *= prec_j
+        if j > 0:
+            y = y * price_scale / self.PRECISION
+        xp[j] = y
+
+        # Calculate price
+        if dx > 10**5 and dy > 10**5:
+            _dx = dx * prec_i
+            _dy = dy * prec_j
+            if i == 0:
+                p = _dx * 10**18 / _dy
+            else:  # j == 0
+                p = _dy * 10**18 / _dx
+
+        self.tweak_price(A_gamma, xp, p, 0)
+
+        return dy
+
+
+    def exchange(i, j, dx, min_dy, use_eth: bool = False):
+        """
+        Exchange using WETH by default
+        """
+        return self._exchange(msg.sender, msg.value, i, j, dx, min_dy, use_eth)
+
+
+    def exchange_underlying(i, j, dx, min_dy):
+        """
+        Exchange using ETH
+        """
+        return self._exchange(msg.sender, msg.value, i, j, dx, min_dy, True)
+
+
+    def get_dy_dx0_xp0(self, i, j, _dx, xp):
+        """
+        get dy with non-scaled dx and xp, returns non-scaled dy
+        """
+        ...
+
+    def get_dy_dx(self, i, j, _dx):
+        """
+        get dy with scaled (human) dx, returns non-scaled dy
+        """
+        ...
+
+    def get_dy_dx_xp(self, i, j, _dx, xp):
+        """
+        get dy with scaled (human) dx and xp, returns non-scaled dy (use self.coins[j].scaled)
+        """
+        ...
+
+    def _get_D(self, _xp, _amp):
+        ...
+
+    def newton_D(self, ANN, gamma, x_unsorted):
+        """
+        Finding the invariant using Newton method.
+        ANN is higher by the factor A_MULTIPLIER
+        ANN is already A * N**N
+
+        Currently uses 60k gas
+        """
+        # Safety checks
+        assert ANN > self.MIN_A - 1 and ANN < self.MAX_A + 1  # dev: unsafe values A
+        assert gamma > self.MIN_GAMMA - 1 and gamma < self.MAX_GAMMA + 1  # dev: unsafe values gamma
+
+        print(f'{x_unsorted=}')
+
+        # Initial value of invariant D is that for constant-product invariant
+        x = x_unsorted
+        if x[0] < x[1]:
+            x = [x_unsorted[1], x_unsorted[0]]
+
+        assert x[0] > 10**9 - 1 and x[0] < 10**15 * 10**18 + 1  # dev: unsafe values x[0]
+        assert x[1] * 10**18 / x[0] > 10**14-1  # dev: unsafe values x[i] (input)
+
+        D = self.n_coins * self.geometric_mean(x, False)
+        S = x[0] + x[1]
+
+        print(f'{D=}')
+
+        for i in range(255):
+            D_prev = D
+
+            # K0 = 10**18
+            # for _x in x:
+            #     K0 = K0 * _x * self.n_coins / D
+            # collapsed for 2 coins
+            K0 = ((10**18 * self.n_coins**2) * x[0] * x[1]) // D // D
+
+            _g1k0 = gamma + 10**18
+            if _g1k0 > K0:
+                _g1k0 = _g1k0 - K0 + 1
+            else:
+                _g1k0 = K0 - _g1k0 + 1
+
+            # D / (A * N**N) * _g1k0**2 / gamma**2
+            mul1 = (((10**18 * D) // gamma * _g1k0) // gamma * _g1k0 * self.A_MULTIPLIER) // ANN
+
+            # 2*N*K0 / _g1k0
+            mul2 = ((2 * 10**18) * self.n_coins * K0) // _g1k0
+
+            neg_fprime = (S + (S * mul2) // 10**18) + (mul1 * self.n_coins) // K0 - (mul2 * D) // 10**18
+
+            # D -= f / fprime
+            D_plus = (D * (neg_fprime + S)) // neg_fprime
+            D_minus = (D*D) // neg_fprime
+            if 10**18 > K0:
+                D_minus += ((D * (mul1 // neg_fprime)) // 10**18 * (10**18 - K0)) // K0
+            else:
+                D_minus -= ((D * (mul1 // neg_fprime)) // 10**18 * (K0 - 10**18)) // K0
+
+            if D_plus > D_minus:
+                D = D_plus - D_minus
+            else:
+                D = (D_minus - D_plus) // 2
+
+            diff = 0
+            if D > D_prev:
+                diff = D - D_prev
+            else:
+                diff = D_prev - D
+            if diff * 10**14 < max(10**16, D):  # Could reduce precision for gas efficiency here
+                # Test that we are safe with the next newton_y
+                for _x in x:
+                    frac = (_x * 10**18) // D
+                    assert (frac > 10**16 - 1) and (frac < 10**20 + 1)  # dev: unsafe values x[i]
+                return D
+
+        raise ValueError(f"Did not converge for D {(D, D_prev, D - D_prev)}")
+
+
+    def geometric_mean(self, unsorted_x, sort):
+        """
+        (x[0] * x[1] * ...) ** (1/N)
+        """
+        x = unsorted_x.copy()
+        if sort and x[0] < x[1]:
+            x = [unsorted_x[1], unsorted_x[0]]
+
+        D = x[0]
+        diff = 0
+
+        for i in range(255):
+            D_prev = D
+            # tmp = 10**18
+            # for _x in x:
+            #     tmp = tmp * _x / D
+            # D = D * ((self.n_coins - 1) * 10**18 + tmp) / (self.n_coins * 10**18)
+            # line below makes it for 2 coins
+
+            D = (D + (x[0] * x[1]) // D) // self.n_coins
+            if D > D_prev:
+                diff = D - D_prev
+            else:
+                diff = D_prev - D
+            if diff <= 1 or diff * 10**18 < D:
+                return D
+
+        raise ValueError(f"Did not converge for geometric_mean {(D, D_prev, D - D_prev)}")
