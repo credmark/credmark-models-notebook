@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from constants import MAX_TICK, MIN_TICK
+from .constants import MAX_TICK, MIN_TICK
 
 UNISWAP_BASE = 1.0001
 

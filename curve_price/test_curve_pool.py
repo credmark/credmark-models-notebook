@@ -28,7 +28,6 @@ if __name__ == '__main__':
 
     cmf_param = {
                  'block_number': end_block,
-                 'chain_to_provider_url': {'1': 'http://192.168.68.122:8545'},
                  'api_url': 'http://192.168.68.122:8700'
                 }
 
