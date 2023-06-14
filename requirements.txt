@@ -1,3 +1,4 @@
 git+https://github.com/credmark/credmark-models-py@main
 seaborn
 plotly
+nbformat>=4.2.0
